@@ -10,6 +10,8 @@ Pick any source/target language pair from the header dropdowns — defaults to S
 - Live mode: auto-retranslate when the on-screen text changes
 - Configurable source/target language pair
 - Optional "source language only" filter to ignore other on-screen text
+- Global hotkey (⌘⇧T) to trigger region-select from anywhere
+- Persistent translation history — click any entry to recall
 
 ## Install
 
@@ -18,8 +20,19 @@ brew install tesseract tesseract-lang python-tk@3.14
 pip3 install pytesseract deep-translator pillow
 ```
 
+Optional extras:
+
+```
+pip3 install langdetect   # sharper "source-only" language filter
+pip3 install pynput       # enables the global ⌘⇧T hotkey
+```
+
+The global hotkey requires macOS Accessibility permission for the Python process. macOS will prompt the first time you press it — grant it in **System Settings → Privacy & Security → Accessibility**.
+
 ## Run
 
 ```
 python3 screen_translate_gui.py
 ```
+
+History is saved to `~/Library/Application Support/ScreenTranslate/history.json`.

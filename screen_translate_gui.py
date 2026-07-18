@@ -26,9 +26,10 @@ import time
 import os
 import re
 import hashlib
+import json
 import threading
 import traceback
-from collections import OrderedDict
+from collections import OrderedDict, deque
 
 try:
     import tkinter as tk
@@ -169,6 +170,27 @@ try:
     _HAS_LANGDETECT = True
 except Exception:
     _HAS_LANGDETECT = False
+
+
+# ---------- Optional global-hotkey backend ----------
+#
+# Uses `pynput` when installed to register a system-wide hotkey (default
+# ⌘⇧T) that triggers "Select region" without focusing the window. macOS
+# will prompt for Accessibility permission the first time.
+try:
+    from pynput import keyboard as _pynput_keyboard  # type: ignore
+    _HAS_PYNPUT = True
+except Exception:
+    _HAS_PYNPUT = False
+
+GLOBAL_HOTKEY = "<cmd>+<shift>+t"
+GLOBAL_HOTKEY_DISPLAY = "⌘⇧T"
+
+
+# ---------- History persistence ----------
+_HISTORY_DIR = os.path.expanduser("~/Library/Application Support/ScreenTranslate")
+_HISTORY_PATH = os.path.join(_HISTORY_DIR, "history.json")
+_HISTORY_MAX = 20
 
 
 _SPANISH_STOPWORDS = frozenset({
@@ -320,6 +342,12 @@ def translate_text(text: str, source: str, target: str) -> str:
     if result:
         _TRANSLATION_CACHE.set(key, result)
     return result
+
+
+def _truncate(text: str, max_len: int) -> str:
+    if len(text) <= max_len:
+        return text
+    return text[: max_len - 1].rstrip() + "…"
 
 
 def copy_to_clipboard(text: str):
@@ -915,7 +943,17 @@ class ScreenTranslateApp:
         self._live_thread = None
         self._live_stop = threading.Event()
 
+        # History (most-recent first).
+        self.history: deque = deque(maxlen=_HISTORY_MAX)
+        self._history_window = None
+        self._history_list_frame = None
+        self._load_history()
+
+        # Global hotkey listener (optional).
+        self._hotkey_listener = None
+
         self._build_ui()
+        self._start_hotkey_listener()
 
     # ---- theme plumbing ----
 
@@ -1072,7 +1110,10 @@ class ScreenTranslateApp:
         self.target_dropdown.pack(side="left")
 
         # --- Quick capture section ---
-        self._make_eyebrow(self.root, "Quick capture").pack(
+        quick_eyebrow_text = "Quick capture"
+        if _HAS_PYNPUT:
+            quick_eyebrow_text += f"  \u00b7  {GLOBAL_HOTKEY_DISPLAY}"
+        self._make_eyebrow(self.root, quick_eyebrow_text).pack(
             fill="x", padx=SIDE, pady=(SECTION_GAP, 8))
         btn_frame = tk.Frame(self.root)
         btn_frame.pack(fill="x", padx=SIDE)
@@ -1081,6 +1122,13 @@ class ScreenTranslateApp:
                           self.on_select_region).pack(side="left", padx=(0, 10))
         self._make_button(btn_frame, "\u2610  Full screen",
                           self.on_full_screen).pack(side="left")
+        if not _HAS_PYNPUT:
+            tk.Label(
+                self.root,
+                text="pip3 install pynput to enable a global \u2318\u21e7T hotkey",
+                fg=THEME["text_dim"], bg=THEME["bg"],
+                font=self._font_status, anchor="w",
+            ).pack(fill="x", padx=SIDE, pady=(6, 0))
 
         # --- Live mode section (in a glass card) ---
         self._make_eyebrow(self.root, "Live mode").pack(
@@ -1172,6 +1220,9 @@ class ScreenTranslateApp:
         copy_row.pack(fill="x", padx=SIDE, pady=(4, 12))
         self._make_button(copy_row, "⧉  Copy translation",
                           self.on_copy, primary=True).pack(side="right")
+        self.history_btn = self._make_button(
+            copy_row, f"⧗  History ({len(self.history)})", self.on_open_history)
+        self.history_btn.pack(side="left")
 
         # --- Status bar (with dot) ---
         self._make_divider(self.root).pack(fill="x", padx=SIDE)
@@ -1297,6 +1348,9 @@ class ScreenTranslateApp:
             self.set_texts(text, translated)
             copy_to_clipboard(translated)
             notify("Screen Translate", "Translation copied to clipboard.")
+            self._record_history(
+                self.source_lang_var.get(), self.target_lang_var.get(),
+                text, translated)
             self.set_status(f"Done at {time.strftime('%H:%M:%S')}")
         except Exception as e:
             traceback.print_exc()
@@ -1544,10 +1598,238 @@ class ScreenTranslateApp:
     def _apply_live_result(self, original, translated):
         self.set_texts(original, translated)
         copy_to_clipboard(translated)
+        self._record_history(
+            self.source_lang_var.get(), self.target_lang_var.get(),
+            original, translated)
         self.set_status(f"Updated {time.strftime('%H:%M:%S')}")
+
+    # --- History ---
+
+    def _load_history(self):
+        try:
+            with open(_HISTORY_PATH) as f:
+                data = json.load(f)
+        except (FileNotFoundError, json.JSONDecodeError, OSError):
+            return
+        if not isinstance(data, list):
+            return
+        # File is stored newest-first; deque uses appendleft on insert, so
+        # replay in reverse to preserve order after loading.
+        for entry in reversed(data[:_HISTORY_MAX]):
+            if isinstance(entry, dict) and "source_text" in entry:
+                self.history.appendleft(entry)
+
+    def _save_history(self):
+        try:
+            os.makedirs(_HISTORY_DIR, exist_ok=True)
+            with open(_HISTORY_PATH, "w") as f:
+                json.dump(list(self.history), f, ensure_ascii=False)
+        except OSError:
+            pass
+
+    def _record_history(self, source_display: str, target_display: str,
+                        source_text: str, translated: str):
+        source_text = source_text.strip()
+        translated = translated.strip()
+        if not source_text or not translated:
+            return
+        if self.history and self.history[0].get("source_text") == source_text \
+                and self.history[0].get("source_lang") == source_display \
+                and self.history[0].get("target_lang") == target_display:
+            # Same input, same pair — don't clutter the list.
+            return
+        self.history.appendleft({
+            "source_lang": source_display,
+            "target_lang": target_display,
+            "source_text": source_text,
+            "translated": translated,
+            "timestamp": time.time(),
+        })
+        self._refresh_history_button()
+        # If the history window is open, refresh it too.
+        if self._history_window is not None and self._history_window.winfo_exists():
+            self._rebuild_history_list()
+
+    def _refresh_history_button(self):
+        btn = getattr(self, "history_btn", None)
+        if btn is not None:
+            btn.config(text=f"⧗  History ({len(self.history)})")
+
+    def on_open_history(self):
+        if self._history_window is not None and self._history_window.winfo_exists():
+            self._history_window.lift()
+            self._history_window.focus_force()
+            return
+        win = tk.Toplevel(self.root)
+        self._history_window = win
+        win.title("Translation history")
+        win.configure(bg=THEME["bg"])
+        win.geometry("560x520")
+        win.minsize(420, 360)
+        win.protocol("WM_DELETE_WINDOW", self._on_close_history_window)
+
+        header = tk.Frame(win, bg=THEME["bg"])
+        header.pack(fill="x", padx=20, pady=(18, 6))
+        tk.Label(header, text="History",
+                 font=self._font_title, fg=THEME["text"],
+                 bg=THEME["bg"], anchor="w").pack(side="left")
+        self._make_button(header, "Clear all", self._clear_history).pack(side="right")
+
+        # Scrollable list area.
+        list_wrap = tk.Frame(win, bg=THEME["bg"])
+        list_wrap.pack(fill="both", expand=True, padx=20, pady=(6, 18))
+        canvas = tk.Canvas(list_wrap, bg=THEME["bg"],
+                           highlightthickness=0, bd=0)
+        scrollbar = tk.Scrollbar(list_wrap, orient="vertical",
+                                 command=canvas.yview)
+        canvas.configure(yscrollcommand=scrollbar.set)
+        canvas.pack(side="left", fill="both", expand=True)
+        scrollbar.pack(side="right", fill="y")
+
+        inner = tk.Frame(canvas, bg=THEME["bg"])
+        inner_id = canvas.create_window((0, 0), window=inner, anchor="nw")
+        # Keep the inner frame width in sync with the canvas so rows fill.
+        def _resize_inner(event):
+            canvas.itemconfig(inner_id, width=event.width)
+        canvas.bind("<Configure>", _resize_inner)
+        inner.bind("<Configure>",
+                   lambda _e: canvas.configure(scrollregion=canvas.bbox("all")))
+
+        # Two-finger scroll on macOS.
+        def _on_wheel(event):
+            canvas.yview_scroll(int(-event.delta), "units")
+        canvas.bind_all("<MouseWheel>", _on_wheel)
+
+        self._history_list_frame = inner
+        self._rebuild_history_list()
+
+    def _on_close_history_window(self):
+        try:
+            # Unbind the global mousewheel binding this window installed.
+            self.root.unbind_all("<MouseWheel>")
+        except Exception:
+            pass
+        if self._history_window is not None:
+            self._history_window.destroy()
+        self._history_window = None
+        self._history_list_frame = None
+
+    def _rebuild_history_list(self):
+        parent = self._history_list_frame
+        if parent is None:
+            return
+        for child in parent.winfo_children():
+            child.destroy()
+        if not self.history:
+            tk.Label(parent, text="No translations yet.",
+                     fg=THEME["text_muted"], bg=THEME["bg"],
+                     font=self._font_body).pack(anchor="w", pady=8)
+            return
+        for entry in self.history:
+            self._make_history_row(parent, entry)
+
+    def _make_history_row(self, parent, entry):
+        row = RoundedFrame(parent, fill=THEME["surface"],
+                            border=THEME["border"],
+                            radius=THEME["radius_card"] - 4,
+                            padx=14, pady=10)
+        row.pack(fill="x", pady=(0, 8))
+
+        meta = tk.Frame(row.body, bg=THEME["surface"])
+        meta.pack(fill="x")
+        pair = f"{entry.get('source_lang', '?')} → {entry.get('target_lang', '?')}"
+        tk.Label(meta, text=pair.upper(),
+                 fg=THEME["text_muted"], bg=THEME["surface"],
+                 font=self._font_eyebrow).pack(side="left")
+        ts = entry.get("timestamp")
+        if isinstance(ts, (int, float)):
+            when = time.strftime("%Y-%m-%d %H:%M", time.localtime(ts))
+            tk.Label(meta, text=when,
+                     fg=THEME["text_dim"], bg=THEME["surface"],
+                     font=self._font_status).pack(side="right")
+
+        src = _truncate(entry.get("source_text", ""), 140)
+        trans = _truncate(entry.get("translated", ""), 140)
+        tk.Label(row.body, text=src, fg=THEME["text"], bg=THEME["surface"],
+                 font=self._font_body_lg, anchor="w", justify="left",
+                 wraplength=460).pack(fill="x", pady=(8, 2))
+        tk.Label(row.body, text=trans, fg=THEME["text_body"],
+                 bg=THEME["surface"],
+                 font=self._font_body, anchor="w", justify="left",
+                 wraplength=460).pack(fill="x")
+
+        def _recall(_e=None):
+            self._recall_entry(entry)
+        # Bind on the row, body, and every child so clicks anywhere recall.
+        for w in (row, row.body, *row.body.winfo_children()):
+            w.bind("<Button-1>", _recall)
+            try:
+                w.config(cursor="hand2")
+            except tk.TclError:
+                pass
+
+    def _recall_entry(self, entry):
+        src_lang = entry.get("source_lang")
+        tgt_lang = entry.get("target_lang")
+        if src_lang in LANG_DISPLAY_TO_GOOGLE:
+            self.source_lang_var.set(src_lang)
+        if tgt_lang in LANG_DISPLAY_TO_GOOGLE:
+            self.target_lang_var.set(tgt_lang)
+        self.set_texts(entry.get("source_text", ""), entry.get("translated", ""))
+        self.set_status("Recalled from history.")
+
+    def _clear_history(self):
+        self.history.clear()
+        self._refresh_history_button()
+        self._rebuild_history_list()
+        self._save_history()
+
+    # --- Global hotkey ---
+
+    def _start_hotkey_listener(self):
+        if not _HAS_PYNPUT:
+            return
+        try:
+            self._hotkey_listener = _pynput_keyboard.GlobalHotKeys({
+                GLOBAL_HOTKEY: self._on_hotkey,
+            })
+            self._hotkey_listener.daemon = True
+            self._hotkey_listener.start()
+        except Exception:
+            # On macOS this most often means the process lacks Accessibility
+            # permission. Log and carry on — hotkey is a nice-to-have.
+            traceback.print_exc()
+            self._hotkey_listener = None
+
+    def _stop_hotkey_listener(self):
+        listener = self._hotkey_listener
+        self._hotkey_listener = None
+        if listener is None:
+            return
+        try:
+            listener.stop()
+        except Exception:
+            pass
+
+    def _on_hotkey(self):
+        """Runs on pynput's listener thread. Marshal to the Tk main thread."""
+        self._post(self._trigger_capture_from_hotkey)
+
+    def _trigger_capture_from_hotkey(self):
+        # Bring the window forward briefly so users get feedback that the
+        # hotkey fired, but don't require it to stay focused for the actual
+        # capture (`screencapture -i` overlays the whole screen anyway).
+        try:
+            self.root.deiconify()
+            self.root.lift()
+        except Exception:
+            pass
+        self.on_select_region()
 
     def on_close(self):
         self._stop_live_thread()
+        self._stop_hotkey_listener()
+        self._save_history()
         self.root.destroy()
 
 
