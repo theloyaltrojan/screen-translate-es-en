@@ -1,12 +1,15 @@
 #!/usr/bin/env python3
 """
-Screen Translate (Spanish -> English) for macOS — GUI version
+Screen Translate for macOS — GUI version
 ----------------------------------------------------------------
 A small always-on-top app window with buttons to:
   - Select a region and translate it once
   - Capture the full screen and translate it
   - Start/stop "Live" mode, which watches a chosen region and
     re-translates automatically whenever the text on screen changes
+
+Any source/target language pair supported by both Google Translate and
+Tesseract can be selected from the header dropdowns.
 
 Run:
     python3 screen_translate_gui.py
@@ -115,7 +118,30 @@ def looks_like_real_text(text: str, min_len: int = 4, min_alpha_ratio: float = 0
 _TESS_CONFIG = "--oem 1 --psm 6"
 
 
-def ocr_spanish(image_path: str, lang: str = "spa") -> str:
+# ---------- Supported languages ----------
+#
+# (display name, Google Translate code, Tesseract language pack code).
+# All Tesseract codes ship with Homebrew's `tesseract-lang` formula.
+LANGUAGES = [
+    ("Spanish",              "es",    "spa"),
+    ("English",              "en",    "eng"),
+    ("French",               "fr",    "fra"),
+    ("German",               "de",    "deu"),
+    ("Portuguese",           "pt",    "por"),
+    ("Italian",              "it",    "ita"),
+    ("Dutch",                "nl",    "nld"),
+    ("Russian",              "ru",    "rus"),
+    ("Chinese (Simplified)", "zh-CN", "chi_sim"),
+    ("Japanese",             "ja",    "jpn"),
+    ("Korean",               "ko",    "kor"),
+    ("Arabic",               "ar",    "ara"),
+]
+LANG_DISPLAY_TO_GOOGLE = {name: g for name, g, _t in LANGUAGES}
+LANG_DISPLAY_TO_TESS   = {name: t for name, _g, t in LANGUAGES}
+LANG_GOOGLE_TO_DISPLAY = {g: name for name, g, _t in LANGUAGES}
+
+
+def ocr_image_path(image_path: str, lang: str = "spa") -> str:
     # psm 6 = "Assume a single uniform block of text". Faster than the default
     # auto page-segmentation pass and a good fit for a small watched region.
     return pytesseract.image_to_string(
@@ -123,12 +149,12 @@ def ocr_spanish(image_path: str, lang: str = "spa") -> str:
     ).strip()
 
 
-def ocr_spanish_image(img, lang: str = "spa") -> str:
+def ocr_image(img, lang: str = "spa") -> str:
     """OCR an already-decoded PIL Image. Skips a second open()/decode when
     the caller has already loaded the image (as the live-mode worker does
-    to compute the change-detection hash). Pass lang="spa+eng" (etc.) to
-    let Tesseract score both language models per word — useful when the
-    watched region contains mixed languages you want to filter down."""
+    to compute the change-detection hash). Pass a compound tag like
+    "spa+eng" to let Tesseract score both language models per word — useful
+    when the watched region contains mixed languages you want to filter down."""
     return pytesseract.image_to_string(img, lang=lang, config=_TESS_CONFIG).strip()
 
 
@@ -193,35 +219,45 @@ def _looks_spanish_heuristic(text: str) -> bool:
     return False
 
 
-def _line_is_spanish(line: str, min_langdetect_chars: int = 15,
-                     min_prob: float = 0.6) -> bool:
+def _line_is_language(line: str, lang_code: str,
+                      min_langdetect_chars: int = 15,
+                      min_prob: float = 0.6) -> bool:
+    """Return True if `line` looks like `lang_code` (Google code, e.g. "es").
+
+    Uses langdetect when available; falls back to the Spanish heuristic
+    when the target is Spanish. For any other target without langdetect
+    installed, we can't classify offline — return True so we don't drop
+    everything."""
     stripped = line.strip()
     if not stripped:
         return False
-    # langdetect is unreliable on short strings — use the heuristic instead.
+    # langdetect returns 2-letter ISO codes ("es", "en", "zh-cn", ...).
+    ld_code = lang_code.lower()
     if not _HAS_LANGDETECT or len(stripped) < min_langdetect_chars:
-        return _looks_spanish_heuristic(stripped)
+        if lang_code == "es":
+            return _looks_spanish_heuristic(stripped)
+        return True
     try:
         langs = detect_langs(stripped)
     except Exception:
-        return _looks_spanish_heuristic(stripped)
+        return _looks_spanish_heuristic(stripped) if lang_code == "es" else True
     if not langs:
-        return _looks_spanish_heuristic(stripped)
+        return _looks_spanish_heuristic(stripped) if lang_code == "es" else True
     best = langs[0]
-    if best.lang == "es" and best.prob >= min_prob:
+    if best.lang == ld_code and best.prob >= min_prob:
         return True
-    # Sometimes langdetect is 50/50 between es and pt/it — trust the
-    # heuristic if it strongly says Spanish, even when langdetect leans other.
-    if best.lang != "en" and _looks_spanish_heuristic(stripped):
+    # Special case: langdetect often splits Spanish 50/50 with pt/it. Trust
+    # the strong Spanish heuristic when it disagrees.
+    if lang_code == "es" and best.lang != "en" and _looks_spanish_heuristic(stripped):
         return True
     return False
 
 
-def filter_spanish_only(text: str) -> str:
-    """Return only the lines of `text` classified as Spanish."""
+def filter_to_language(text: str, lang_code: str) -> str:
+    """Return only the lines of `text` classified as `lang_code`."""
     if not text:
         return ""
-    kept = [line for line in text.splitlines() if _line_is_spanish(line)]
+    kept = [line for line in text.splitlines() if _line_is_language(line, lang_code)]
     return "\n".join(l.strip() for l in kept).strip()
 
 
@@ -232,11 +268,20 @@ def perceptual_image_hash(img) -> bytes:
     return hashlib.blake2b(thumb.tobytes(), digest_size=16).digest()
 
 
-# Reuse a single translator instance across calls. deep-translator holds a
-# `requests.Session` internally, and reusing it avoids the per-call TCP/TLS
-# handshake — a big win when polling.
-_TRANSLATOR = GoogleTranslator(source="es", target="en")
+# Reuse translator instances across calls, keyed by (source, target). Each
+# GoogleTranslator holds a `requests.Session` internally, so reusing avoids
+# the per-call TCP/TLS handshake — a big win when polling in live mode.
+_TRANSLATORS: dict = {}
 _TRANSLATOR_LOCK = threading.Lock()
+
+
+def _get_translator(source: str, target: str) -> GoogleTranslator:
+    key = (source, target)
+    t = _TRANSLATORS.get(key)
+    if t is None:
+        t = GoogleTranslator(source=source, target=target)
+        _TRANSLATORS[key] = t
+    return t
 
 # Small LRU cache. Live mode very often re-sees the same phrase (subtitles,
 # menus, dialog boxes), and a cache hit is essentially free.
@@ -262,16 +307,18 @@ class _LRU:
 _TRANSLATION_CACHE = _LRU(maxsize=512)
 
 
-def translate_to_english(text: str) -> str:
+def translate_text(text: str, source: str, target: str) -> str:
     if not text:
         return ""
-    cached = _TRANSLATION_CACHE.get(text)
+    key = (source, target, text)
+    cached = _TRANSLATION_CACHE.get(key)
     if cached is not None:
         return cached
+    translator = _get_translator(source, target)
     with _TRANSLATOR_LOCK:
-        result = _TRANSLATOR.translate(text)
+        result = translator.translate(text)
     if result:
-        _TRANSLATION_CACHE.set(text, result)
+        _TRANSLATION_CACHE.set(key, result)
     return result
 
 
@@ -526,6 +573,133 @@ class RoundedButton(tk.Canvas):
     configure = config
 
 
+class RoundedDropdown(tk.Canvas):
+    """Pill-shaped dropdown. Renders the current value of a StringVar plus a
+    chevron; clicking pops up a tk.Menu with `options`. Themed to match
+    RoundedButton so it slots into the same rows."""
+
+    def __init__(self, parent, variable, options, *,
+                 bg, fg, hover_bg=None, active_bg=None,
+                 border=None, menu_bg=None, menu_fg=None,
+                 menu_active_bg=None, menu_active_fg=None,
+                 font=None, radius=12, padx=16, pady=9,
+                 min_width=0, on_change=None, **kw):
+        parent_bg = RoundedButton._resolve_parent_bg(parent)
+        super().__init__(parent, bg=parent_bg,
+                         highlightthickness=0, bd=0, **kw)
+        self._var = variable
+        self._option_values = list(options)
+        self._on_change = on_change
+        self._bg = bg
+        self._hover_bg = hover_bg or bg
+        self._active_bg = active_bg or hover_bg or bg
+        self._menu_bg = menu_bg or bg
+        self._menu_fg = menu_fg or fg
+        self._menu_active_bg = menu_active_bg or (hover_bg or bg)
+        self._menu_active_fg = menu_active_fg or fg
+        self._font = font
+        self._enabled = True
+
+        # Size for the widest option so the pill doesn't jump when the value
+        # changes. Chevron gets a fixed 14px slot.
+        widest = max((self._measure(o) for o in self._option_values), default=(0, 0))
+        tw, th = widest
+        chevron_w = 14
+        gap = 8
+        w = max(int(tw) + chevron_w + gap + 2 * padx, int(min_width))
+        h = int(th) + 2 * pady
+        self._btn_w, self._btn_h = w, h
+        super().configure(width=w, height=h)
+
+        self._shape = _rounded_rect(
+            self, 1, 1, w - 1, h - 1, radius,
+            fill=bg, outline=(border or bg), width=1,
+        )
+        label_x = padx
+        self._label = self.create_text(
+            label_x, h // 2, text=str(self._var.get()),
+            fill=fg, font=font, anchor="w",
+        )
+        # Down chevron drawn as a small V.
+        cx = w - padx - chevron_w // 2
+        cy = h // 2
+        self._chevron = self.create_line(
+            cx - 4, cy - 2,  cx, cy + 3,  cx + 4, cy - 2,
+            fill=fg, width=2, capstyle="round", joinstyle="round",
+        )
+
+        self.bind("<Enter>", self._on_enter)
+        self.bind("<Leave>", self._on_leave)
+        self.bind("<ButtonPress-1>", self._on_press)
+        self.bind("<ButtonRelease-1>", self._open_menu)
+        self.config(cursor="hand2")
+
+        # Keep label in sync when the variable is written externally.
+        self._var.trace_add("write", lambda *_a: self._render())
+
+    def _measure(self, text: str):
+        tmp = self.create_text(0, 0, text=text, font=self._font, anchor="nw")
+        bx = self.bbox(tmp) or (0, 0, 0, 0)
+        self.delete(tmp)
+        return bx[2] - bx[0], bx[3] - bx[1]
+
+    def _paint(self, fill):
+        self.itemconfig(self._shape, fill=fill)
+
+    def _on_enter(self, _e):
+        if self._enabled:
+            self._paint(self._hover_bg)
+
+    def _on_leave(self, _e):
+        if self._enabled:
+            self._paint(self._bg)
+
+    def _on_press(self, _e):
+        if self._enabled:
+            self._paint(self._active_bg)
+
+    def _open_menu(self, _e):
+        if not self._enabled:
+            return
+        self._paint(self._hover_bg)
+        menu = tk.Menu(
+            self, tearoff=0,
+            bg=self._menu_bg, fg=self._menu_fg,
+            activebackground=self._menu_active_bg,
+            activeforeground=self._menu_active_fg,
+            bd=0, relief="flat",
+            font=self._font,
+        )
+        for opt in self._option_values:
+            menu.add_command(label=opt, command=lambda o=opt: self._select(o))
+        x = self.winfo_rootx()
+        y = self.winfo_rooty() + self._btn_h
+        try:
+            menu.tk_popup(x, y)
+        finally:
+            menu.grab_release()
+
+    def _select(self, value):
+        if value == self._var.get():
+            return
+        self._var.set(value)
+        if self._on_change is not None:
+            self._on_change(value)
+
+    def _render(self):
+        self.itemconfig(self._label, text=str(self._var.get()))
+
+    def config(self, **kw):
+        if "state" in kw:
+            state = kw.pop("state")
+            self._enabled = (state != "disabled")
+            self._paint(self._bg)
+        if kw:
+            super().configure(**kw)
+
+    configure = config
+
+
 class RoundedFrame(tk.Frame):
     """A frame with a rounded-corner filled background. Children pack into
     `.body`. The body drives the frame's requested size; the rounded fill is
@@ -611,7 +785,7 @@ class RoundedCheckbox(tk.Canvas):
             fill=check_fg, width=2, state="hidden",
             capstyle="round", joinstyle="round",
         )
-        self.create_text(
+        self._label_item = self.create_text(
             pad + box_size + gap, h // 2,
             text=text, font=font, fill=fg, anchor="w",
         )
@@ -640,6 +814,9 @@ class RoundedCheckbox(tk.Canvas):
         else:
             self.itemconfig(self._box, fill=self._box_bg, outline=self._box_border)
             self.itemconfig(self._check, state="hidden")
+
+    def set_text(self, text: str):
+        self.itemconfig(self._label_item, text=text)
 
 
 class RoundedStepper(tk.Frame):
@@ -710,6 +887,12 @@ class ScreenTranslateApp:
         self.root.minsize(500, 640)
         self._font_family = _resolve_font_family(root)
         self._apply_theme_globals()
+
+        # Language pair (display names — see LANGUAGES for supported set).
+        self.source_lang_var = tk.StringVar(value="Spanish")
+        self.target_lang_var = tk.StringVar(value="English")
+        self.source_lang_var.trace_add("write", lambda *_a: self._on_language_change())
+        self.target_lang_var.trace_add("write", lambda *_a: self._on_language_change())
 
         self.live_running = False
         self.live_rect = None
@@ -852,15 +1035,41 @@ class ScreenTranslateApp:
         SIDE = 22  # horizontal window inset
         SECTION_GAP = 14  # vertical gap between logical sections
 
-        # --- App header (title + subtitle) ---
+        # --- App header (title + language selectors) ---
         header = tk.Frame(self.root, bg=THEME["bg"])
         header.pack(fill="x", padx=SIDE, pady=(22, 4))
         tk.Label(header, text="Screen Translate",
                  font=self._font_title, fg=THEME["text"],
                  bg=THEME["bg"], anchor="w").pack(anchor="w")
-        tk.Label(header, text="Spanish \u2192 English",
-                 font=self._font_subtitle, fg=THEME["text_muted"],
-                 bg=THEME["bg"], anchor="w").pack(anchor="w", pady=(2, 0))
+
+        lang_row = tk.Frame(header, bg=THEME["bg"])
+        lang_row.pack(anchor="w", pady=(6, 0))
+        options = [name for name, _g, _t in LANGUAGES]
+        self.source_dropdown = RoundedDropdown(
+            lang_row, self.source_lang_var, options,
+            bg=THEME["surface"], fg=THEME["text"],
+            hover_bg=THEME["surface_2"], active_bg=THEME["surface_press"],
+            border=THEME["border"],
+            menu_bg=THEME["surface"], menu_fg=THEME["text"],
+            menu_active_bg=THEME["surface_2"], menu_active_fg=THEME["text"],
+            font=self._font_body_lg,
+            radius=THEME["radius_button"],
+        )
+        self.source_dropdown.pack(side="left")
+        tk.Label(lang_row, text="  \u2192  ",
+                 font=self._font_body_lg, fg=THEME["text_muted"],
+                 bg=THEME["bg"]).pack(side="left")
+        self.target_dropdown = RoundedDropdown(
+            lang_row, self.target_lang_var, options,
+            bg=THEME["surface"], fg=THEME["text"],
+            hover_bg=THEME["surface_2"], active_bg=THEME["surface_press"],
+            border=THEME["border"],
+            menu_bg=THEME["surface"], menu_fg=THEME["text"],
+            menu_active_bg=THEME["surface_2"], menu_active_fg=THEME["text"],
+            font=self._font_body_lg,
+            radius=THEME["radius_button"],
+        )
+        self.target_dropdown.pack(side="left")
 
         # --- Quick capture section ---
         self._make_eyebrow(self.root, "Quick capture").pack(
@@ -911,16 +1120,17 @@ class ScreenTranslateApp:
             fill="x", pady=(20, 16))
 
         # Custom rounded checkbox — replaces the default tk.Checkbutton.
-        self.spanish_only_var = tk.BooleanVar(value=False)
-        RoundedCheckbox(
+        self.source_only_var = tk.BooleanVar(value=False)
+        self.source_only_checkbox = RoundedCheckbox(
             live_card.body,
-            "Spanish only — filter out other languages",
-            self.spanish_only_var,
+            self._source_only_label(),
+            self.source_only_var,
             fg=THEME["text_body"], accent=THEME["accent"],
             box_bg=THEME["surface_2"], box_border=THEME["border_hi"],
             check_fg=THEME["bg_deep"],
             font=self._font_body_lg,
-        ).pack(anchor="w", pady=(0, 2))
+        )
+        self.source_only_checkbox.pack(anchor="w", pady=(0, 2))
         if not _HAS_LANGDETECT:
             # Show the install hint as a small muted note underneath — keeps
             # the checkbox label a normal length so it doesn't blow out width.
@@ -941,7 +1151,9 @@ class ScreenTranslateApp:
         # --- Original text (glass card) ---
         orig_head = tk.Frame(self.root, bg=THEME["bg"])
         orig_head.pack(fill="x", padx=SIDE, pady=(SECTION_GAP, 8))
-        self._make_eyebrow(orig_head, "Original — Spanish").pack(side="left")
+        self.orig_eyebrow = self._make_eyebrow(
+            orig_head, f"Original — {self.source_lang_var.get()}")
+        self.orig_eyebrow.pack(side="left")
 
         orig_card, self.orig_box = self._make_text_card(self.root, height=1)
         orig_card.pack(fill="both", expand=True, padx=SIDE, pady=(0, 8))
@@ -949,7 +1161,9 @@ class ScreenTranslateApp:
         # --- Translated text (glass card) ---
         trans_head = tk.Frame(self.root, bg=THEME["bg"])
         trans_head.pack(fill="x", padx=SIDE, pady=(6, 8))
-        self._make_eyebrow(trans_head, "Translation — English").pack(side="left")
+        self.trans_eyebrow = self._make_eyebrow(
+            trans_head, f"Translation — {self.target_lang_var.get()}")
+        self.trans_eyebrow.pack(side="left")
 
         trans_card, self.trans_box = self._make_text_card(self.root, height=1)
         trans_card.pack(fill="both", expand=True, padx=SIDE, pady=(0, 8))
@@ -992,6 +1206,30 @@ class ScreenTranslateApp:
         else:
             color = THEME["accent_soft"]
         dot.config(fg=color)
+
+    def _source_only_label(self) -> str:
+        return f"{self.source_lang_var.get()} only — filter out other languages"
+
+    def _on_language_change(self):
+        """Refresh dynamic labels + reset live-mode state so the new pair takes
+        effect on the next tick. Also clears cached-image detection so we
+        re-OCR immediately."""
+        src = self.source_lang_var.get()
+        tgt = self.target_lang_var.get()
+        for attr, label in (("orig_eyebrow", f"Original — {src}"),
+                            ("trans_eyebrow", f"Translation — {tgt}")):
+            widget = getattr(self, attr, None)
+            if widget is not None:
+                widget.config(text=label.upper())
+        checkbox = getattr(self, "source_only_checkbox", None)
+        if checkbox is not None:
+            checkbox.set_text(self._source_only_label())
+        # Force the next live-mode tick to re-OCR and re-translate under the
+        # new pair rather than short-circuiting on the cached hash.
+        self._last_image_hash = None
+        self.last_live_text = None
+        self._pending_text = None
+        self._pending_since = 0.0
 
     def _post(self, fn, *args, **kwargs):
         """Schedule `fn(*args, **kwargs)` to run on the Tk main thread.
@@ -1038,9 +1276,12 @@ class ScreenTranslateApp:
         if not path:
             self.set_status("No selection made.")
             return
+        source_tess = LANG_DISPLAY_TO_TESS[self.source_lang_var.get()]
+        source_g = LANG_DISPLAY_TO_GOOGLE[self.source_lang_var.get()]
+        target_g = LANG_DISPLAY_TO_GOOGLE[self.target_lang_var.get()]
         try:
             try:
-                raw = ocr_spanish(path)
+                raw = ocr_image_path(path, lang=source_tess)
             finally:
                 _safe_unlink(path)
 
@@ -1052,7 +1293,7 @@ class ScreenTranslateApp:
 
             self.set_status("Translating...")
             self.root.update()
-            translated = translate_to_english(text)
+            translated = translate_text(text, source_g, target_g)
             self.set_texts(text, translated)
             copy_to_clipboard(translated)
             notify("Screen Translate", "Translation copied to clipboard.")
@@ -1063,9 +1304,10 @@ class ScreenTranslateApp:
 
     # --- Translation with exponential backoff ---
 
-    def _translate_with_backoff(self, text: str):
-        """Translate `text`, or return None if we're inside a backoff window
-        or the call fails. On failure, grows the backoff window.
+    def _translate_with_backoff(self, text: str, source: str, target: str):
+        """Translate `text` from `source` to `target` (Google codes), or return
+        None if we're inside a backoff window or the call fails. On failure,
+        grows the backoff window.
 
         Safe to call from either the Tk main thread or the live-mode worker
         thread — all status-bar writes go through _post."""
@@ -1075,7 +1317,7 @@ class ScreenTranslateApp:
             self._post(self.set_status, f"Rate-limited; retrying in {remaining}s...")
             return None
         try:
-            translated = translate_to_english(text)
+            translated = translate_text(text, source, target)
         except Exception as e:
             traceback.print_exc()
             self._backoff_seconds = (
@@ -1210,6 +1452,12 @@ class ScreenTranslateApp:
 
         now = time.monotonic()
 
+        source_display = self.source_lang_var.get()
+        target_display = self.target_lang_var.get()
+        source_tess = LANG_DISPLAY_TO_TESS[source_display]
+        source_g = LANG_DISPLAY_TO_GOOGLE[source_display]
+        target_g = LANG_DISPLAY_TO_GOOGLE[target_display]
+
         # 3. If the frame hasn't changed AND we have a pending candidate that's
         # been sitting there for at least _STABILITY_SECS, the text has stopped
         # moving — translate now. Otherwise, skip OCR entirely.
@@ -1218,7 +1466,7 @@ class ScreenTranslateApp:
             if (pending
                     and pending != self.last_live_text
                     and (now - self._pending_since) >= self._STABILITY_SECS):
-                translated = self._translate_with_backoff(pending)
+                translated = self._translate_with_backoff(pending, source_g, target_g)
                 if translated is not None:
                     self.last_live_text = pending
                     self._pending_text = None
@@ -1227,15 +1475,15 @@ class ScreenTranslateApp:
             return
         self._last_image_hash = image_hash
 
-        # 4. OCR the already-decoded image. When the Spanish-only filter is on
-        # we run Tesseract with both Spanish and English models so English text
-        # is recognized cleanly (not butchered into Spanish-looking gibberish
-        # by the spa-only model), giving the language classifier a clean input
-        # to reject.
-        spanish_only = bool(self.spanish_only_var.get())
-        ocr_lang = "spa+eng" if spanish_only else "spa"
+        # 4. OCR the already-decoded image. When the source-only filter is on
+        # we run Tesseract with both the source and English models so that
+        # English (or other Latin-script) UI chrome is recognized cleanly
+        # rather than butchered by the source-only model — giving the
+        # language classifier a clean input to reject.
+        source_only = bool(self.source_only_var.get())
+        ocr_lang = f"{source_tess}+eng" if (source_only and source_tess != "eng") else source_tess
         try:
-            raw = ocr_spanish_image(img, lang=ocr_lang)
+            raw = ocr_image(img, lang=ocr_lang)
         except Exception:
             traceback.print_exc()
             self._post(self.set_status, "OCR failed; retrying...")
@@ -1249,14 +1497,14 @@ class ScreenTranslateApp:
             self._post(self.set_status, "Watching for text...")
             return
 
-        if spanish_only:
-            filtered = filter_spanish_only(text)
+        if source_only:
+            filtered = filter_to_language(text, source_g)
             if not filtered:
                 # There may be lots of English/UI text on screen — don't spam
-                # "noisy frame"; just say we're waiting for Spanish.
+                # "noisy frame"; just say we're waiting for the source lang.
                 self._pending_text = None
                 self._pending_since = 0.0
-                self._post(self.set_status, "No Spanish text detected...")
+                self._post(self.set_status, f"No {source_display} text detected...")
                 return
             text = filtered
 
@@ -1286,7 +1534,7 @@ class ScreenTranslateApp:
             # Same text as last tick but not stable long enough yet.
             return
 
-        translated = self._translate_with_backoff(text)
+        translated = self._translate_with_backoff(text, source_g, target_g)
         if translated is not None:
             self.last_live_text = text
             self._pending_text = None
